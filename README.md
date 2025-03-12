@@ -27,5 +27,3 @@ The required model is automatically downloaded from Hugging Face if not present 
 MIT License. See `LICENSE` for more details.  
 
 ---
-
-Let me know if you need any other tweaks! 🚀
