@@ -1,12 +1,14 @@
 import os
+import re
 import torch
 import soundfile as sf
 import logging
 import argparse
 import gradio as gr
+import numpy as np
 from datetime import datetime
 from cli.SparkTTS import SparkTTS
-from sparktts.utils.token_parser import LEVELS_MAP_UI
+from sparktts.utils.token_parser import LEVELS_MAP_UI, TASK_TOKEN_MAP
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
@@ -114,6 +116,17 @@ def generate(text,
     try:
         with torch.no_grad():
             print("Starting inference...")
+            # Store the global_token_ids for saving later
+            global_token_ids = None
+            if prompt_speech:
+                # Get global_token_ids from the voice prompt
+                prompt, global_token_ids = model.process_prompt(
+                    text,
+                    prompt_speech,
+                    prompt_text
+                )
+            
+            # Call the inference method
             wav = model.inference(
                 text,
                 prompt_speech,
@@ -122,12 +135,43 @@ def generate(text,
                 pitch,
                 speed,
             )
+            
+            # Get global_token_ids from the generated voice if we're doing controlled generation
+            if gender is not None and global_token_ids is None:
+                # We need to capture the generated global tokens from the model
+                # In controlled generation, global tokens are generated during inference
+                # Do a second inference call with a short text to extract tokens
+                short_text = "This is a voice sample."
+                with torch.no_grad():
+                    prompt = model.process_prompt_control(gender, pitch, speed, short_text)
+                    model_inputs = model.tokenizer([prompt], return_tensors="pt").to(model.device)
+                    generated_ids = model.model.generate(
+                        **model_inputs,
+                        max_new_tokens=100,
+                        do_sample=True,
+                        top_k=50,
+                        top_p=0.95,
+                        temperature=0.8,
+                    )
+                    # Decode the generated tokens into text
+                    predicts = model.tokenizer.batch_decode(
+                        [generated_ids[0][len(model_inputs.input_ids[0]):]], 
+                        skip_special_tokens=True
+                    )[0]
+                    # Extract global token IDs
+                    global_token_matches = re.findall(r"bicodec_global_(\d+)", predicts)
+                    if global_token_matches:
+                        global_token_ids = torch.tensor([int(token) for token in global_token_matches]).long().unsqueeze(0)
+            
             print("Inference completed successfully!")
     finally:
         # Restore the original generate method
         model.model.generate = original_generate
     
-    return wav
+    # Return both the audio and the global tokens if available
+    if global_token_ids is not None:
+        return wav, global_token_ids
+    return wav, None
 
 
 def run_tts(
@@ -151,16 +195,17 @@ def run_tts(
     # Generate unique filename using timestamp
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     save_path = os.path.join(save_dir, f"{timestamp}.wav")
+    voice_model_path = os.path.join(save_dir, f"{timestamp}_voice.pt")
 
     logging.info("Starting inference...")
     print("=" * 50)
     print(f"Processing text: '{text[:50]}{'...' if len(text) > 50 else ''}'")
     
     # Show progress bar for the overall process
-    with tqdm(total=2, desc="TTS Process", position=0) as pbar:
+    with tqdm(total=3, desc="TTS Process", position=0) as pbar:
         # Perform inference
         pbar.set_description("Generating audio")
-        wav = generate(text,
+        wav, global_tokens = generate(text,
                 prompt_speech,
                 prompt_text,
                 gender,
@@ -173,13 +218,47 @@ def run_tts(
         print(f"Saving audio to: {save_path}")
         sf.write(save_path, wav, samplerate=16000)
         pbar.update(1)
+        
+        # Save the voice model if available
+        if global_tokens is not None:
+            pbar.set_description("Saving voice model")
+            print(f"Saving voice model to: {voice_model_path}")
+            
+            # Save in compatible format - wrap the tensor in a dictionary
+            # with metadata to make it compatible with test.pt
+            model_dict = {
+                "global_tokens": global_tokens.cpu().detach(),  # Move to CPU and detach from graph
+                "created_at": timestamp,
+                "model_type": "Spark-TTS-Voice",
+                "version": "1.0"
+            }
+            
+            # Add metadata for voice type if available
+            if gender is not None:
+                model_dict["voice_type"] = {
+                    "gender": gender,
+                    "pitch": pitch,
+                    "speed": speed
+                }
+            
+            torch.save(model_dict, voice_model_path)
+            pbar.update(1)
+        else:
+            pbar.update(1)
+    
+    result_files = {"audio": save_path}
+    if global_tokens is not None:
+        result_files["voice_model"] = voice_model_path
+        print(f"Voice model saved successfully at: {voice_model_path}")
     
     print(f"Audio saved successfully at: {save_path}")
     print("=" * 50)
 
     logging.info(f"Audio saved at: {save_path}")
+    if global_tokens is not None:
+        logging.info(f"Voice model saved at: {voice_model_path}")
 
-    return save_path
+    return result_files
 
 
 def build_ui(model_dir, device=0):
@@ -204,12 +283,16 @@ def build_ui(model_dir, device=0):
         prompt_speech = prompt_wav_upload if prompt_wav_upload else prompt_wav_record
         prompt_text_clean = None if len(prompt_text) < 2 else prompt_text
 
-        audio_output_path = run_tts(
+        result_files = run_tts(
             text,
             prompt_text=prompt_text_clean,
             prompt_speech=prompt_speech
         )
-        return audio_output_path
+        
+        # Return audio file and voice model file if available
+        if "voice_model" in result_files:
+            return result_files["audio"], result_files["voice_model"]
+        return result_files["audio"], None
 
     # Define callback function for creating new voices
     def voice_creation(text, gender, pitch, speed):
@@ -221,13 +304,17 @@ def build_ui(model_dir, device=0):
         """
         pitch_val = LEVELS_MAP_UI[int(pitch)]
         speed_val = LEVELS_MAP_UI[int(speed)]
-        audio_output_path = run_tts(
+        result_files = run_tts(
             text,
             gender=gender,
             pitch=pitch_val,
             speed=speed_val
         )
-        return audio_output_path
+        
+        # Return audio file and voice model file if available
+        if "voice_model" in result_files:
+            return result_files["audio"], result_files["voice_model"]
+        return result_files["audio"], None
 
     with gr.Blocks(theme=gr.themes.Soft(
         primary_hue="blue",
@@ -339,12 +426,21 @@ def build_ui(model_dir, device=0):
                     '<div style="margin-top: 20px;"><h3 style="color: #60a5fa; font-weight: 500; margin-bottom: 15px;">Generated Output</h3></div>'
                 )
                 
-                audio_output = gr.Audio(
-                    label="Generated Audio",
-                    autoplay=True,
-                    streaming=True,
-                    elem_classes="audio-output"
+                gr.HTML(
+                    '<div style="background-color: #1e293b; border-radius: 8px; padding: 12px 16px; margin-bottom: 15px; border-left: 4px solid #f97316;"><p style="color: #f8fafc; font-size: 14px; margin: 0;"><strong>Note:</strong> All generated audio files and voice models are automatically saved to the <code>example/results</code> directory. To use your saved voice model in future sessions, navigate to the "Use Saved Voice" tab and upload the .pt file.</p></div>'
                 )
+                
+                with gr.Row():
+                    audio_output = gr.Audio(
+                        label="Generated Audio",
+                        autoplay=True,
+                        streaming=True,
+                        elem_classes="audio-output"
+                    )
+                    voice_model_output = gr.File(
+                        label="Voice Model File (PT)",
+                        elem_classes="voice-model-output"
+                    )
 
                 generate_buttom_clone = gr.Button("Generate Voice Clone", size="lg", elem_classes="generate-button")
 
@@ -356,7 +452,7 @@ def build_ui(model_dir, device=0):
                         prompt_wav_upload,
                         prompt_wav_record,
                     ],
-                    outputs=[audio_output],
+                    outputs=[audio_output, voice_model_output],
                 )
 
             # Voice Creation Tab
@@ -403,17 +499,85 @@ def build_ui(model_dir, device=0):
                     '<div style="margin-top: 20px;"><h3 style="color: #60a5fa; font-weight: 500; margin-bottom: 15px;">Generated Output</h3></div>'
                 )
                 
-                audio_output = gr.Audio(
-                    label="Generated Audio", 
-                    autoplay=True, 
-                    streaming=True,
-                    elem_classes="audio-output"
+                gr.HTML(
+                    '<div style="background-color: #1e293b; border-radius: 8px; padding: 12px 16px; margin-bottom: 15px; border-left: 4px solid #f97316;"><p style="color: #f8fafc; font-size: 14px; margin: 0;"><strong>Note:</strong> All generated audio files and voice models are automatically saved to the <code>example/results</code> directory. To use your saved voice model in future sessions, navigate to the "Use Saved Voice" tab and upload the .pt file.</p></div>'
                 )
                 
+                with gr.Row():
+                    audio_output = gr.Audio(
+                        label="Generated Audio", 
+                        autoplay=True, 
+                        streaming=True,
+                        elem_classes="audio-output"
+                    )
+                    voice_model_output = gr.File(
+                        label="Voice Model File (PT)",
+                        elem_classes="voice-model-output"
+                    )
+
                 create_button.click(
                     voice_creation,
                     inputs=[text_input_creation, gender, pitch, speed],
-                    outputs=[audio_output],
+                    outputs=[audio_output, voice_model_output],
+                )
+
+            # Use Saved Voice Model Tab
+            with gr.TabItem("Use Saved Voice"):
+                gr.HTML(
+                    '<div style="margin-top: 10px;"><h3 style="color: #60a5fa; font-weight: 500; margin-bottom: 15px;">Generate speech using a saved voice model</h3></div>'
+                )
+                
+                with gr.Row():
+                    saved_voice_upload = gr.File(
+                        label="Upload Voice Model File (.pt)",
+                        file_types=[".pt"],
+                        elem_classes="voice-model-input"
+                    )
+                
+                with gr.Row():
+                    saved_voice_text = gr.Textbox(
+                        label="Text to synthesize",
+                        lines=5,
+                        placeholder="Enter text here",
+                        value="This is a test of using a saved voice model file.",
+                        elem_classes="text-input"
+                    )
+                
+                saved_voice_button = gr.Button("Generate Speech", size="lg", elem_classes="generate-button")
+                
+                gr.HTML(
+                    '<div style="margin-top: 20px;"><h3 style="color: #60a5fa; font-weight: 500; margin-bottom: 15px;">Generated Output</h3></div>'
+                )
+                
+                with gr.Row():
+                    saved_voice_audio = gr.Audio(
+                        label="Generated Audio",
+                        autoplay=True,
+                        streaming=True,
+                        elem_classes="audio-output"
+                    )
+                    status_box = gr.Textbox(
+                        label="Status",
+                        placeholder="Status will be shown here",
+                        elem_classes="status-output"
+                    )
+                
+                def use_saved_voice(text, voice_model_path):
+                    if not voice_model_path:
+                        return None, "Please upload a voice model file (.pt)"
+                    
+                    try:
+                        audio_path = synthesize_with_voice_model(text, voice_model_path)
+                        return audio_path, "Voice synthesis completed successfully!"
+                    except Exception as e:
+                        error_msg = f"Error using saved voice model: {str(e)}"
+                        print(error_msg)
+                        return None, error_msg
+                
+                saved_voice_button.click(
+                    use_saved_voice,
+                    inputs=[saved_voice_text, saved_voice_upload],
+                    outputs=[saved_voice_audio, status_box],
                 )
 
     return demo
@@ -449,6 +613,150 @@ def parse_arguments():
         help="Server port for Gradio app."
     )
     return parser.parse_args()
+
+def load_voice_model(voice_model_path):
+    """
+    Load a saved voice model file (.pt) containing global tokens.
+    
+    Args:
+        voice_model_path: Path to the voice model file
+        
+    Returns:
+        torch.Tensor or dict: The loaded global tokens or model dictionary
+    """
+    if not os.path.exists(voice_model_path):
+        raise FileNotFoundError(f"Voice model file not found: {voice_model_path}")
+    
+    print(f"Loading voice model from: {voice_model_path}")
+    
+    try:
+        # Try to load the voice model
+        loaded_data = torch.load(voice_model_path)
+        
+        # Check if it's a dictionary (new format) or tensor (old format)
+        if isinstance(loaded_data, dict) and "global_tokens" in loaded_data:
+            # New format - dictionary with metadata
+            global_tokens = loaded_data["global_tokens"]
+            if not isinstance(global_tokens, torch.Tensor):
+                raise ValueError("Invalid voice model format: 'global_tokens' is not a tensor")
+            return loaded_data
+        elif isinstance(loaded_data, torch.Tensor):
+            # Old format - just the tensor
+            return loaded_data
+        else:
+            raise ValueError(f"Invalid voice model format. Expected a tensor or a dictionary with 'global_tokens'")
+    except Exception as e:
+        print(f"Error loading voice model: {e}")
+        raise ValueError(f"Failed to load voice model: {str(e)}")
+
+    return global_tokens
+
+
+def synthesize_with_voice_model(text, voice_model_path, save_dir="example/results"):
+    """
+    Synthesize speech using a saved voice model.
+    
+    Args:
+        text: Text to synthesize
+        voice_model_path: Path to the voice model file
+        save_dir: Directory to save the resulting audio
+        
+    Returns:
+        str: Path to the generated audio file
+    """
+    global MODEL
+    
+    # Initialize model if not already done
+    if MODEL is None:
+        print("Initializing model...")
+        MODEL = initialize_model(device="cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load the voice global tokens
+    loaded_data = load_voice_model(voice_model_path)
+    
+    # Handle both new and old format
+    if isinstance(loaded_data, dict) and "global_tokens" in loaded_data:
+        # New format - dictionary with metadata
+        global_tokens = loaded_data["global_tokens"]
+        print(f"Loaded voice model: {loaded_data.get('model_type', 'Unknown')}, version: {loaded_data.get('version', 'Unknown')}")
+        if "voice_type" in loaded_data:
+            voice_type = loaded_data["voice_type"]
+            print(f"Voice type: gender={voice_type.get('gender', 'unknown')}, pitch={voice_type.get('pitch', 'unknown')}, speed={voice_type.get('speed', 'unknown')}")
+    else:
+        # Old format - just the tensor
+        global_tokens = loaded_data
+        print("Loaded legacy format voice model")
+    
+    # Move to correct device
+    global_tokens = global_tokens.to(MODEL.device)
+    
+    # Ensure the save directory exists
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Generate unique filename using timestamp
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    save_path = os.path.join(save_dir, f"{timestamp}.wav")
+    
+    print(f"Synthesizing speech with saved voice for text: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+    
+    with torch.no_grad():
+        # Prepare the input tokens for the model
+        global_tokens_str = "".join(
+            [f"<|bicodec_global_{i}|>" for i in global_tokens.squeeze()]
+        )
+        
+        inputs = [
+            TASK_TOKEN_MAP["tts"],
+            "<|start_content|>",
+            text,
+            "<|end_content|>",
+            "<|start_global_token|>",
+            global_tokens_str,
+            "<|end_global_token|>",
+        ]
+        
+        inputs = "".join(inputs)
+        model_inputs = MODEL.tokenizer([inputs], return_tensors="pt").to(MODEL.device)
+        
+        # Generate speech using the model
+        generated_ids = MODEL.model.generate(
+            **model_inputs,
+            max_new_tokens=3000,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.8,
+        )
+        
+        # Trim the output tokens to remove the input tokens
+        generated_ids = [
+            output_ids[len(input_ids):]
+            for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        
+        # Decode the generated tokens into text
+        predicts = MODEL.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        # Extract semantic token IDs from the generated text
+        pred_semantic_ids = (
+            torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicts)])
+            .long()
+            .unsqueeze(0)
+        )
+        
+        # Convert semantic tokens back to waveform
+        wav = MODEL.audio_tokenizer.detokenize(
+            global_tokens.squeeze(0),
+            pred_semantic_ids.to(MODEL.device),
+        )
+    
+    # Save the audio
+    print(f"Saving audio to: {save_path}")
+    sf.write(save_path, wav, samplerate=16000)
+    
+    print(f"Audio saved successfully at: {save_path}")
+    
+    return save_path
 
 if __name__ == "__main__":
     # Parse command-line arguments
